@@ -1,3 +1,23 @@
+/**
+ * OpenTelemetry Server Utilities for Nuxt/Nitro
+ *
+ * Provides distributed tracing with automatic trace propagation from frontend.
+ * Traces are exported directly to Axiom.
+ *
+ * Usage:
+ *   // In API handlers, use defineTracedHandler for automatic tracing
+ *   export default defineTracedHandler("get-user", async (event, span) => {
+ *     const user = await fetchUser(123);
+ *     return ok(user);
+ *   });
+ *
+ *   // Or use createSpan for internal operations
+ *   const result = await createSpan("db-query", async (span) => {
+ *     span.setAttribute("db.table", "users");
+ *     return ok(await db.query("SELECT * FROM users"));
+ *   });
+ */
+
 import {
   trace,
   context,
@@ -6,40 +26,50 @@ import {
   propagation,
   ROOT_CONTEXT,
 } from "@opentelemetry/api";
+import type { Span } from "@opentelemetry/api";
 import type { NodeSDK as NodeSDKType } from "@opentelemetry/sdk-node";
 import type { H3Event } from "h3";
+import { Result, err, ok } from "neverthrow";
 
-/**
- * Custom error class that includes trace context for client responses.
- */
-export class TracedError extends Error {
-  public readonly traceId: string;
-  public readonly spanId: string;
-  public readonly statusCode: number;
+// ============================================================================
+// Types
+// ============================================================================
 
-  constructor(
-    message: string,
-    options: { traceId: string; spanId: string; statusCode?: number }
-  ) {
-    super(message);
-    this.name = "TracedError";
-    this.traceId = options.traceId;
-    this.spanId = options.spanId;
-    this.statusCode = options.statusCode ?? 500;
-  }
-
-  toJSON() {
-    return {
-      error: this.message,
-      traceId: this.traceId,
-      spanId: this.spanId,
-    };
-  }
+/** Error type that includes trace context for client responses */
+export interface TracedErr {
+  message: string;
+  traceId: string;
+  spanId: string;
+  statusCode: number;
+  cause?: unknown;
 }
+
+/** Base error type for traced handlers */
+export interface HandlerError {
+  message: string;
+  statusCode: number;
+}
+
+export interface SpanOptions {
+  kind?: SpanKind;
+  attributes?: Record<string, string | number | boolean>;
+}
+
+// ============================================================================
+// State
+// ============================================================================
 
 let sdk: NodeSDKType | null = null;
 let initialized = false;
 
+// ============================================================================
+// Initialization
+// ============================================================================
+
+/**
+ * Initialize OpenTelemetry SDK.
+ * Called automatically by the server plugin.
+ */
 export async function initOtel() {
   if (initialized) return sdk;
   initialized = true;
@@ -56,35 +86,35 @@ export async function initOtel() {
     return null;
   }
 
-  const { NodeSDK } = await import("@opentelemetry/sdk-node");
-  const { OTLPTraceExporter } = await import(
-    "@opentelemetry/exporter-trace-otlp-proto"
-  );
-  const { Resource } = await import("@opentelemetry/resources");
-  const { SEMRESATTRS_SERVICE_NAME, SEMRESATTRS_SERVICE_VERSION } =
-    await import("@opentelemetry/semantic-conventions");
-  const { W3CTraceContextPropagator } = await import("@opentelemetry/core");
+  const [
+    { NodeSDK },
+    { OTLPTraceExporter },
+    { resourceFromAttributes },
+    { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION },
+    { W3CTraceContextPropagator },
+  ] = await Promise.all([
+    import("@opentelemetry/sdk-node"),
+    import("@opentelemetry/exporter-trace-otlp-proto"),
+    import("@opentelemetry/resources"),
+    import("@opentelemetry/semantic-conventions"),
+    import("@opentelemetry/core"),
+  ]);
 
-  // Set up W3C Trace Context propagation BEFORE starting SDK
+  // Set up W3C Trace Context propagation before starting SDK
   propagation.setGlobalPropagator(new W3CTraceContextPropagator());
 
-  const traceExporter = new OTLPTraceExporter({
-    url: "https://eu-central-1.aws.edge.axiom.co/v1/traces",
-    headers: {
-      Authorization: `Bearer ${axiomToken}`,
-      "X-Axiom-Dataset": axiomDataset,
-    },
-  });
-
-  const resource = new Resource({
-    [SEMRESATTRS_SERVICE_NAME]: serviceName,
-    [SEMRESATTRS_SERVICE_VERSION]: "1.0.0",
-  });
-
-  // Don't use HttpInstrumentation - Nitro/h3 doesn't use Node's http module
   sdk = new NodeSDK({
-    resource,
-    traceExporter,
+    resource: resourceFromAttributes({
+      [ATTR_SERVICE_NAME]: serviceName,
+      [ATTR_SERVICE_VERSION]: "1.0.0",
+    }),
+    traceExporter: new OTLPTraceExporter({
+      url: "https://eu-central-1.aws.edge.axiom.co/v1/traces",
+      headers: {
+        Authorization: `Bearer ${axiomToken}`,
+        "X-Axiom-Dataset": axiomDataset,
+      },
+    }),
   });
 
   sdk.start();
@@ -97,42 +127,58 @@ export async function initOtel() {
   return sdk;
 }
 
+// ============================================================================
+// Core Functions
+// ============================================================================
+
+/** Get the tracer instance */
 export function getTracer() {
   const config = useRuntimeConfig();
   return trace.getTracer(config.public.otelServiceName as string, "1.0.0");
 }
 
 /**
- * Extract trace context from incoming H3 request headers.
+ * Extract trace context from incoming request headers.
  * This allows continuing a trace started on the frontend.
  */
 export function extractTraceContext(event: H3Event) {
   const headers = getHeaders(event);
-  // Create a carrier object from the headers
   const carrier: Record<string, string> = {};
+
   for (const [key, value] of Object.entries(headers)) {
     if (value) carrier[key] = value;
   }
-  // Extract the context from the traceparent header
+
   return propagation.extract(ROOT_CONTEXT, carrier);
 }
 
 /**
- * Create a span that continues from the frontend trace context.
- * Use this in API handlers to link frontend and backend traces.
- * Automatically adds X-Trace-Id and X-Span-Id response headers.
- *
- * On error, throws a TracedError with trace context for the client.
+ * Create a TracedErr from any error within a span context.
  */
-export function createSpanFromRequest<T>(
+export function toTracedErr(
+  error: unknown,
+  span: Span,
+  statusCode = 500
+): TracedErr {
+  const { traceId, spanId } = span.spanContext();
+  const message = error instanceof Error ? error.message : String(error);
+  return { message, traceId, spanId, statusCode, cause: error };
+}
+
+// ============================================================================
+// Span Creation
+// ============================================================================
+
+/**
+ * Create a span that continues from the frontend trace context.
+ * Automatically adds X-Trace-Id and X-Span-Id response headers.
+ */
+export function createSpanFromRequest<T, E>(
   event: H3Event,
   name: string,
-  fn: (span: any) => Promise<T> | T,
-  options?: {
-    kind?: SpanKind;
-    attributes?: Record<string, string | number | boolean>;
-  }
-): Promise<T> {
+  fn: (span: Span) => Promise<Result<T, E>>,
+  options?: SpanOptions
+): Promise<Result<T, E & { traceId: string; spanId: string }>> {
   const parentContext = extractTraceContext(event);
   const tracer = getTracer();
 
@@ -143,139 +189,183 @@ export function createSpanFromRequest<T>(
         kind: options?.kind ?? SpanKind.SERVER,
         attributes: options?.attributes,
       },
-      async (span: any): Promise<T> => {
-        // Add trace ID to response headers for debugging/Postman
-        const spanContext = span.spanContext();
-        const traceId = spanContext.traceId;
-        const spanId = spanContext.spanId;
+      parentContext,
+      async (
+        span
+      ): Promise<Result<T, E & { traceId: string; spanId: string }>> => {
+        const { traceId, spanId } = span.spanContext();
 
+        // Add trace IDs to response headers for debugging
         setHeader(event, "X-Trace-Id", traceId);
         setHeader(event, "X-Span-Id", spanId);
 
-        try {
-          const result = await fn(span);
-          span.setStatus({ code: SpanStatusCode.OK });
-          span.end();
-          return result;
-        } catch (error) {
-          const err = error as Error;
+        const result = await fn(span);
 
-          // Record exception and set error status on span
-          span.recordException(err);
-          span.setStatus({
-            code: SpanStatusCode.ERROR,
-            message: err.message,
-          });
+        if (result.isErr()) {
+          const error = result.error;
+          const message = getErrorMessage(error);
+
+          span.recordException(
+            error instanceof Error ? error : new Error(message)
+          );
+          span.setStatus({ code: SpanStatusCode.ERROR, message });
           span.setAttribute("error", true);
-          span.setAttribute("error.message", err.message);
+          span.setAttribute("error.message", message);
           span.end();
 
-          // Throw a TracedError so the client gets the trace ID
-          throw createError({
-            statusCode: (err as any).statusCode ?? 500,
-            statusMessage: err.message,
-            data: {
-              error: err.message,
-              traceId,
-              spanId,
-            },
-          });
+          return err({ ...error, traceId, spanId });
         }
+
+        span.setStatus({ code: SpanStatusCode.OK });
+        span.end();
+        return ok(result.value);
       }
     );
   });
 }
 
 /**
- * Create a span without request context (for internal operations).
+ * Create a span for internal operations.
+ * Automatically becomes a child of the current active span.
  */
-export function createSpan<T>(
+export function createSpan<T, E>(
   name: string,
-  fn: (span: any) => Promise<T> | T,
-  options?: {
-    kind?: SpanKind;
-    attributes?: Record<string, string | number | boolean>;
-  }
-): Promise<T> {
+  fn: (span: Span) => Promise<Result<T, E>>,
+  options?: SpanOptions
+): Promise<Result<T, E>> {
   return getTracer().startActiveSpan(
     name,
-    { kind: options?.kind, attributes: options?.attributes },
-    async (span: any): Promise<T> => {
-      try {
-        const result = await fn(span);
-        span.setStatus({ code: SpanStatusCode.OK });
-        span.end();
-        return result;
-      } catch (error) {
-        const err = error as Error;
-        span.recordException(err);
-        span.setStatus({
-          code: SpanStatusCode.ERROR,
-          message: err.message,
-        });
+    {
+      kind: options?.kind ?? SpanKind.INTERNAL,
+      attributes: options?.attributes,
+    },
+    async (span): Promise<Result<T, E>> => {
+      const result = await fn(span);
+
+      if (result.isErr()) {
+        const message = getErrorMessage(result.error);
+        span.recordException(
+          result.error instanceof Error ? result.error : new Error(message)
+        );
+        span.setStatus({ code: SpanStatusCode.ERROR, message });
         span.setAttribute("error", true);
         span.end();
-        throw error;
+        return result;
       }
+
+      span.setStatus({ code: SpanStatusCode.OK });
+      span.end();
+      return result;
     }
   );
 }
 
 /**
- * Fire and forget: Run an async function in the background with its own span.
- * The span is linked to the current trace but doesn't block the response.
- *
- * @example
- * await createSpanFromRequest(event, "api-handler", async (span) => {
- *   // Fire off background task - doesn't block response
- *   fireAndForget("send-welcome-email", async (bgSpan) => {
- *     await sendEmail(user.email, "Welcome!");
- *   });
- *
- *   return { success: true }; // Returns immediately
- * });
+ * Run an async function in the background with its own span.
+ * Linked to the current trace but doesn't block the response.
  */
-export function fireAndForget(
+export function createSpanInBackground<E>(
   name: string,
-  fn: (span: any) => Promise<void>,
-  options?: {
-    kind?: SpanKind;
-    attributes?: Record<string, string | number | boolean>;
-  }
+  fn: (span: Span) => Promise<Result<void, E>>,
+  options?: SpanOptions
 ): void {
-  // Capture the current context so the background span is linked to the trace
   const currentContext = context.active();
   const tracer = getTracer();
 
-  // Start the background work without awaiting
   context.with(currentContext, () => {
     tracer.startActiveSpan(
       name,
       {
         kind: options?.kind ?? SpanKind.INTERNAL,
         attributes: {
-          "span.type": "fire-and-forget",
+          "span.type": "background",
           ...options?.attributes,
         },
       },
-      async (span: any) => {
-        try {
-          await fn(span);
+      async (span) => {
+        const result = await fn(span);
+
+        if (result.isErr()) {
+          const message = getErrorMessage(result.error);
+          console.error(`[OTEL] Background task "${name}" failed:`, message);
+          span.recordException(
+            result.error instanceof Error ? result.error : new Error(message)
+          );
+          span.setStatus({ code: SpanStatusCode.ERROR, message });
+        } else {
           span.setStatus({ code: SpanStatusCode.OK });
-        } catch (error) {
-          const err = error as Error;
-          console.error(`[fireAndForget] ${name} failed:`, err.message);
-          span.recordException(err);
-          span.setStatus({
-            code: SpanStatusCode.ERROR,
-            message: err.message,
-          });
-        } finally {
-          span.end();
         }
+
+        span.end();
       }
     );
   });
 }
 
+// ============================================================================
+// Handler Factory
+// ============================================================================
+
+/**
+ * Define a traced event handler with automatic error handling.
+ *
+ * @example
+ * export default defineTracedHandler("get-user", async (event, span) => {
+ *   const user = await fetchUser(123);
+ *   if (!user) {
+ *     return err({ message: "User not found", statusCode: 404 });
+ *   }
+ *   return ok(user);
+ * });
+ */
+export function defineTracedHandler<T, E extends HandlerError>(
+  name: string,
+  fn: (event: H3Event, span: Span) => Promise<Result<T, E>>,
+  options?: SpanOptions
+) {
+  return defineEventHandler(async (event: H3Event) => {
+    const result = await createSpanFromRequest(
+      event,
+      name,
+      (span) => fn(event, span),
+      {
+        kind: options?.kind ?? SpanKind.SERVER,
+        attributes: options?.attributes,
+      }
+    );
+
+    if (result.isErr()) {
+      throw createError({
+        statusCode: result.error.statusCode,
+        statusMessage: result.error.message,
+        data: {
+          error: result.error.message,
+          traceId: result.error.traceId,
+          spanId: result.error.spanId,
+        },
+      });
+    }
+
+    return result.value;
+  });
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "object" && error !== null && "message" in error) {
+    return String((error as { message: unknown }).message);
+  }
+  return String(error);
+}
+
+// ============================================================================
+// Exports
+// ============================================================================
+
 export { trace, context, SpanKind, SpanStatusCode };
+export { ok, err, Result } from "neverthrow";
+export type { Span };

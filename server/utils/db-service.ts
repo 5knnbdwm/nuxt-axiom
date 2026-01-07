@@ -1,14 +1,19 @@
-import { createSpan, SpanKind } from "./otel";
+import { createSpan, SpanKind, ok, err, type Result } from "./otel";
 
 /**
  * Example database service with traced operations.
  */
 
+export type DbError = {
+  code: "CONNECTION_ERROR" | "QUERY_ERROR" | "NOT_FOUND";
+  message: string;
+};
+
 export async function queryDatabase<T>(
   operation: string,
   query: string,
-  fn: () => Promise<T>
-): Promise<T> {
+  fn: () => Promise<Result<T, DbError>>
+): Promise<Result<T, DbError>> {
   return createSpan(
     `db.${operation}`,
     async (span) => {
@@ -16,22 +21,23 @@ export async function queryDatabase<T>(
       span.setAttribute("db.operation", operation);
       span.setAttribute("db.statement", query);
 
-      const result = await fn();
-
-      return result;
+      return fn();
     },
     { kind: SpanKind.CLIENT }
   );
 }
 
-export async function findOne(table: string, id: number) {
+export async function findOne(
+  table: string,
+  id: number
+): Promise<Result<{ id: number; table: string; found: true }, DbError>> {
   return queryDatabase(
     "findOne",
     `SELECT * FROM ${table} WHERE id = ?`,
     async () => {
       // Simulate DB query
       await new Promise((resolve) => setTimeout(resolve, 15));
-      return { id, table, found: true };
+      return ok({ id, table, found: true as const });
     }
   );
 }
@@ -39,14 +45,14 @@ export async function findOne(table: string, id: number) {
 export async function insertRecord(
   table: string,
   data: Record<string, unknown>
-) {
+): Promise<Result<{ id: number } & Record<string, unknown>, DbError>> {
   return queryDatabase(
     "insert",
     `INSERT INTO ${table} VALUES (?)`,
     async () => {
       // Simulate DB insert
       await new Promise((resolve) => setTimeout(resolve, 25));
-      return { id: Math.floor(Math.random() * 1000), ...data };
+      return ok({ id: Math.floor(Math.random() * 1000), ...data });
     }
   );
 }
