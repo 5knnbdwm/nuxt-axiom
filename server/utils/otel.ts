@@ -55,6 +55,9 @@ export interface SpanOptions {
   attributes?: Record<string, string | number | boolean>;
 }
 
+/** Key for storing trace context in H3 event */
+const TRACE_CONTEXT_KEY = "__otel_trace_context__";
+
 // ============================================================================
 // State
 // ============================================================================
@@ -153,6 +156,27 @@ export function extractTraceContext(event: H3Event) {
 }
 
 /**
+ * Store trace context in the event for downstream handlers/middleware.
+ */
+function setEventTraceContext(
+  event: H3Event,
+  ctx: ReturnType<typeof context.active>
+) {
+  (event as unknown as Record<string, unknown>)[TRACE_CONTEXT_KEY] = ctx;
+}
+
+/**
+ * Get stored trace context from the event, or extract from headers if not set.
+ */
+function getEventTraceContext(event: H3Event) {
+  const stored = (event as unknown as Record<string, unknown>)[
+    TRACE_CONTEXT_KEY
+  ];
+  if (stored) return stored as ReturnType<typeof context.active>;
+  return extractTraceContext(event);
+}
+
+/**
  * Create a TracedErr from any error within a span context.
  */
 export function toTracedErr(
@@ -170,7 +194,7 @@ export function toTracedErr(
 // ============================================================================
 
 /**
- * Create a span that continues from the frontend trace context.
+ * Create a span that continues from the trace context (either from middleware or frontend headers).
  * Automatically adds X-Trace-Id and X-Span-Id response headers.
  */
 export function createSpanFromRequest<T, E>(
@@ -179,7 +203,8 @@ export function createSpanFromRequest<T, E>(
   fn: (span: Span) => Promise<Result<T, E>>,
   options?: SpanOptions
 ): Promise<Result<T, E & { traceId: string; spanId: string }>> {
-  const parentContext = extractTraceContext(event);
+  // Use stored context from middleware if available, otherwise extract from headers
+  const parentContext = getEventTraceContext(event);
   const tracer = getTracer();
 
   return context.with(parentContext, () => {
@@ -198,6 +223,9 @@ export function createSpanFromRequest<T, E>(
         // Add trace IDs to response headers for debugging
         setHeader(event, "X-Trace-Id", traceId);
         setHeader(event, "X-Span-Id", spanId);
+
+        // Store context for any nested handlers
+        setEventTraceContext(event, trace.setSpan(parentContext, span));
 
         const result = await fn(span);
 
@@ -303,11 +331,93 @@ export function createSpanInBackground<E>(
 }
 
 // ============================================================================
+// Middleware Factory
+// ============================================================================
+
+/**
+ * Define a traced middleware with automatic span creation.
+ * The trace context is passed to downstream handlers, making them siblings in the same trace.
+ *
+ * @example
+ * // server/middleware/auth.ts
+ * export default defineTracedMiddleware("auth-middleware", async (event, span) => {
+ *   const token = getHeader(event, "authorization");
+ *   if (!token) {
+ *     return err({ message: "Unauthorized", statusCode: 401 });
+ *   }
+ *
+ *   span.setAttribute("auth.method", "bearer");
+ *   const user = await validateToken(token);
+ *   event.context.user = user;
+ *   return ok(undefined);
+ * });
+ */
+export function defineTracedMiddleware<E extends HandlerError>(
+  name: string,
+  fn: (event: H3Event, span: Span) => Promise<Result<void, E>>,
+  options?: SpanOptions
+) {
+  return defineEventHandler(async (event: H3Event) => {
+    // Extract trace context from headers (frontend propagation)
+    const parentContext = getEventTraceContext(event);
+    const tracer = getTracer();
+
+    return context.with(parentContext, () => {
+      return tracer.startActiveSpan(
+        name,
+        {
+          kind: options?.kind ?? SpanKind.SERVER,
+          attributes: {
+            "middleware.name": name,
+            ...options?.attributes,
+          },
+        },
+        parentContext,
+        async (span) => {
+          const { traceId, spanId } = span.spanContext();
+
+          // Store context with this span for downstream handlers
+          const newContext = trace.setSpan(parentContext, span);
+          setEventTraceContext(event, newContext);
+
+          // Set trace headers early so they're available even if middleware fails
+          setHeader(event, "X-Trace-Id", traceId);
+          setHeader(event, "X-Span-Id", spanId);
+
+          const result = await fn(event, span);
+
+          if (result.isErr()) {
+            const error = result.error;
+            const message = getErrorMessage(error);
+
+            span.recordException(new Error(message));
+            span.setStatus({ code: SpanStatusCode.ERROR, message });
+            span.setAttribute("error", true);
+            span.setAttribute("error.message", message);
+            span.end();
+
+            throw createError({
+              statusCode: error.statusCode,
+              statusMessage: message,
+              data: { error: message, traceId, spanId },
+            });
+          }
+
+          span.setStatus({ code: SpanStatusCode.OK });
+          span.end();
+        }
+      );
+    });
+  });
+}
+
+// ============================================================================
 // Handler Factory
 // ============================================================================
 
 /**
  * Define a traced event handler with automatic error handling.
+ * If preceded by traced middleware, becomes a child span of the middleware.
  *
  * @example
  * export default defineTracedHandler("get-user", async (event, span) => {
